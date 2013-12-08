@@ -24,6 +24,7 @@ object NettyServer extends App {
       .localAddress("localhost", 8100)
       .childHandler(new ChannelInitializer[SocketChannel] {
       def initChannel(ch: SocketChannel) {
+        println("connected")
         ch.pipeline()
           .addLast(new DelimiterBasedFrameDecoder(10000, Unpooled.copiedBuffer("\n",Charset.forName("UTF-8"))))
           .addLast(new StringDecoder())
@@ -32,12 +33,16 @@ object NettyServer extends App {
 
 
           override def channelRead(ctx: ChannelHandlerContext, msg: Any) {
-            println("server received " + msg)
+            println(ctx.channel() + ": server received " + msg)
             nMsgs.incrementAndGet()
-            if(nMsgs.get() == 5)
-              ctx.disconnect().sync()
+            if(nMsgs.get() == 5)      {
+              println("disconnecting")
+              //ctx.close().sync()
+              ctx.channel().close().sync()
+              println("disconnected")
+            }
             else
-              ctx.writeAndFlush(msg)
+              ctx.writeAndFlush(msg + "\n")
           }
 
           override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {

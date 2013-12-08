@@ -24,22 +24,36 @@ object NettyClientRunner extends App {
     def initChannel(ch: SocketChannel) {
       ch.pipeline()
 //        .addLast(new ReadTimeoutHandler(1))
+        .addLast(new DelimiterBasedFrameDecoder(10000, Unpooled.copiedBuffer("\n",Charset.forName("UTF-8"))))
         .addLast(new StringDecoder())
-        //.addLast(new DelimiterBasedFrameDecoder(10000, Unpooled.copiedBuffer("\n",Charset.forName("UTF-8"))))
         .addLast(new StringEncoder())
     }
   })
 
-  val client = new NettyClient(bs, Executors.newScheduledThreadPool(1))
+  val scheduler = Executors.newScheduledThreadPool(1)
+
+  val client = new NettyClient(bs, scheduler)
   implicit val ctx = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(2))
 
+  scheduler.scheduleAtFixedRate(new Runnable {
+    def run() {
+      client.submitCommand("ping")
+    }
+  }, 500, 500, TimeUnit.MILLISECONDS)
+
   val futs = for(i <- 1 to 10)
-    yield {
-      Thread.sleep(1000)
-      client.submitCommand("message"  + i + "\n").map {
-        case v: String => println("received " + v)
-      }
+  yield {
+//    Thread.sleep(1000)
+    val fut = client.submitCommand("message"  + i + "\n")
+    fut.onSuccess {
+      case v: String => println("received " + v)
+    }
+    fut.onFailure {
+      case e: Throwable => println("failed processing message" + i)
+    }
+    fut
   }
+
 
   Await.result(Future.sequence(futs), Duration(1000, TimeUnit.SECONDS))
 

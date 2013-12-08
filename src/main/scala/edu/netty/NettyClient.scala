@@ -12,7 +12,7 @@ import edu.netty.NettyClient.StateUpdateResult
 import edu.netty.NettyClient.WaitingForConnection
 
 class NettyClient(bs: Bootstrap, scheduler: ScheduledExecutorService) {
-  private val stateRef = new AtomicReference[ClientState](new WaitingForConnection(Queue.empty) with EventLogger )
+  private val stateRef = new AtomicReference[ClientState](new WaitingForConnection(Queue.empty) with EventLogger)
 
   @tailrec
   private def updateState[T](f: ClientState => StateUpdateResult[T]): T = {
@@ -32,8 +32,8 @@ class NettyClient(bs: Bootstrap, scheduler: ScheduledExecutorService) {
           if(future.isSuccess) {
             updateState(_.commandSent(cmd))
           } else {
-            updateState(_.sendFailure(cmd)).apply()
-            future.channel().pipeline().fireExceptionCaught(future.cause())
+            updateState(_.sendFailure(future.cause(), cmd)).apply()
+//            future.channel().pipeline().fireExceptionCaught(future.cause())
 
           }
         }
@@ -46,55 +46,31 @@ class NettyClient(bs: Bootstrap, scheduler: ScheduledExecutorService) {
   }
 
   private class NettyConnector extends Connector {
-    @tailrec
-    private def failAll(cause: Throwable) {
-      val (toFail, toRun) = updateState(_.connectionBroken(cause, NettyConnector.this))
-      toFail.foreach(_._2.failure(cause))
-      toRun.apply()
-      if(!toFail.isEmpty) {
-        failAll(cause)
-      }
-    }
-
 
     def connectAsync() {
       bs.connect("localhost", 8100).addListener(new ChannelFutureListener {
         def operationComplete(future: ChannelFuture) {
           if(future.isSuccess) {
-            println("connected")
             val channel = future.channel()
             channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
               override def channelRead(ctx: ChannelHandlerContext, msg: Any) {
-                println("Client message received " + msg)
                 updateState(_.responseReceived(msg.toString)).apply()
               }
 
               override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-                failAll(cause)
-              }
-            }).addLast(new ChannelOutboundHandlerAdapter() {
-              override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-                failAll(cause)
+                updateState(_.receiveFailure(cause)).apply()
               }
             })
 
-
             val sender = new NettySender(future.channel())
-            @tailrec
-            def sendRetries() {
-              val retries = updateState(_.connectionEstablished(sender))
-              if(!retries.isEmpty) {
-                retries.foreach(sender.send)
-                sendRetries()
-              }
-            }
 
-            sendRetries()
+            updateState(_.connectionEstablished(sender, NettyConnector.this)).apply()
 
           } else {
             val cause = future.cause()
             println("connection failed " + cause)
-            failAll(cause)
+            updateState(_.connectionBroken(future.cause(), NettyConnector.this)).apply()
+            //failAll(cause)
           }
         }
       })
@@ -146,114 +122,136 @@ object NettyClient {
 
     def send(cmd: CommandAndResponse): StateUpdateResult[ArtifactFunction]
 
-    def commandSent(cmd: CommandAndResponse): StateUpdateResult[Unit]
-    def sendFailure(cmd: CommandAndResponse): StateUpdateResult[ArtifactFunction]
+    def commandSent(cmd: CommandAndResponse): StateUpdateResult[ArtifactFunction] = illegalState("commandSent")
+    def sendFailure(cause: Throwable, cmd: CommandAndResponse): StateUpdateResult[ArtifactFunction] = illegalState("sendFailure")
 
-    def responseReceived(response: String): StateUpdateResult[ArtifactFunction]
+    def responseReceived(response: String): StateUpdateResult[ArtifactFunction] = illegalState("responseReceived")
+    def receiveFailure(cause: Throwable): StateUpdateResult[ArtifactFunction] = illegalState("receiveFailure")
 
-
-    def connectionEstablished(sender: Sender): StateUpdateResult[CommandQueue]
-    def connectionBroken(cause: Throwable, connector: Connector): StateUpdateResult[(CommandQueue, ArtifactFunction)]
+    def connectionEstablished(sender: Sender, connector: Connector): StateUpdateResult[ArtifactFunction] = illegalState("connectionEstablished")
+    def connectionBroken(cause: Throwable, connector: Connector): StateUpdateResult[ArtifactFunction] = illegalState("connectionBroken")
   }
 
   trait EventLogger extends ClientState{
-    private def logCall(method: String, args: Any*) {
+    private def logCall[T](actualCall: => T, method: String, args: Any*): T = {
       println(getClass.getSuperclass.getSimpleName + "." + method + ": " + args.map(_.toString.replace("\n","\\n")))
+      actualCall
     }
 
-    abstract override def send(cmd: NettyClient.CommandAndResponse): StateUpdateResult[NettyClient.ArtifactFunction] = {
-      logCall("send", cmd)
-      super.send(cmd)
 
+    abstract override def send(cmd: NettyClient.CommandAndResponse): StateUpdateResult[NettyClient.ArtifactFunction] =
+      logCall(super.send(cmd), "send", cmd)
+
+    abstract override def commandSent(cmd: NettyClient.CommandAndResponse): StateUpdateResult[ArtifactFunction] =
+      logCall(super.commandSent(cmd), "commandSent", cmd)
+
+    abstract override def sendFailure(cause: Throwable, cmd: NettyClient.CommandAndResponse): StateUpdateResult[NettyClient.ArtifactFunction] =
+      logCall(super.sendFailure(cause, cmd), "sendFailure", cause, cmd)
+
+    abstract override def responseReceived(response: String): StateUpdateResult[NettyClient.ArtifactFunction] =
+      logCall(super.responseReceived(response), "responseReceived", response)
+
+    abstract override def receiveFailure(cause: Throwable): StateUpdateResult[NettyClient.ArtifactFunction] =
+      logCall(super.receiveFailure(cause), "receiveFailure", cause)
+
+    abstract override def connectionEstablished(sender: Sender, connector: Connector): StateUpdateResult[ArtifactFunction] =
+      logCall(super.connectionEstablished(sender, connector), "connectionEstablished")
+
+    abstract override def connectionBroken(cause: Throwable, connector: Connector): StateUpdateResult[NettyClient.ArtifactFunction] =
+      logCall(super.connectionBroken(cause, connector), "connectionBroken", cause)
+  }
+
+  case class WaitingForConnection(retries: CommandQueue) extends ClientState {
+    override def send(cmd: CommandAndResponse) = StateUpdateResult(DoNothing, new WaitingForConnection(retries.enqueue(cmd)) with EventLogger)
+
+    override def connectionEstablished(sender: Sender, connector: Connector) = if(retries.isEmpty) {
+      StateUpdateResult(DoNothing, new ConnectionEstablished(sender, connector, 0, Queue.empty, Queue.empty) with EventLogger)
+    } else {
+      StateUpdateResult(() => retries.foreach(sender.send), new RetryingFailedSends(sender,connector, retries.size, Queue.empty, Queue.empty, Queue.empty) with EventLogger)
     }
 
-    abstract override def commandSent(cmd: NettyClient.CommandAndResponse): StateUpdateResult[Unit] = {
-      logCall("commandSent", cmd)
-      super.commandSent(cmd)
-    }
+    override def connectionBroken(cause: Throwable, connector: Connector) = {
+      def failPendingAndScheduleReconnect() {
+        retries.foreach(_._2.failure(cause))
+        connector.scheduleConnect(5000)
+      }
 
-    abstract override def sendFailure(cmd: NettyClient.CommandAndResponse): StateUpdateResult[ArtifactFunction] = {
-      logCall("sendFailure", cmd)
-      super.sendFailure(cmd)
-    }
-
-    abstract override def responseReceived(response: String): StateUpdateResult[NettyClient.ArtifactFunction] = {
-      logCall("responseReceived", response)
-      super.responseReceived(response)
-    }
-
-    abstract override def connectionEstablished(sender: Sender): StateUpdateResult[NettyClient.CommandQueue] = {
-      logCall("connectionEstablished", sender)
-      super.connectionEstablished(sender)
-    }
-
-    abstract override def connectionBroken(cause: Throwable, connector: Connector): StateUpdateResult[(NettyClient.CommandQueue, NettyClient.ArtifactFunction)] = {
-      logCall("connectionBroken", cause, connector)
-      super.connectionBroken(cause,connector)
+      StateUpdateResult(() => failPendingAndScheduleReconnect(), new ConnectionBroken(cause) with EventLogger)
     }
   }
 
-  case class WaitingForConnection(pending: CommandQueue) extends ClientState {
-    override def send(cmd: CommandAndResponse) = StateUpdateResult(DoNothing, new WaitingForConnection(pending.enqueue(cmd)) with EventLogger)
+  case class RetryingFailedSends(sender: Sender, connector: Connector,
+                                 nPendingSends: Int,
+                                 pendingReplies: CommandQueue,
+                                 failedSends: CommandQueue,
+                                 incomingCommands: CommandQueue) extends ClientState {
 
-    override def commandSent(cmd: CommandAndResponse): StateUpdateResult[Unit] = illegalState("commandSent")
+    def send(cmd: NettyClient.CommandAndResponse): StateUpdateResult[NettyClient.ArtifactFunction] =
+      StateUpdateResult(DoNothing, new RetryingFailedSends(sender, connector, nPendingSends, pendingReplies, incomingCommands.enqueue(cmd), failedSends) with EventLogger)
 
-    override def sendFailure(cmd: NettyClient.CommandAndResponse): StateUpdateResult[ArtifactFunction] = illegalState("sendFailure")
-
-    override def responseReceived(response: String): StateUpdateResult[ArtifactFunction] = illegalState("responseReceived")
-
-    override def connectionEstablished(sender: Sender) = if(pending.isEmpty) {
-      StateUpdateResult(Queue.empty[CommandAndResponse], new ConnectionEstablished(sender, Queue.empty, Queue.empty) with EventLogger)
+    override def commandSent(cmd: CommandAndResponse): StateUpdateResult[ArtifactFunction] = if(nPendingSends == 1) {
+      StateUpdateResult(() => incomingCommands.foreach(sender.send), new ConnectionEstablished(sender, connector, incomingCommands.size, pendingReplies.enqueue(cmd), Queue.empty) with EventLogger)
     } else {
-      StateUpdateResult(pending, new WaitingForConnection(Queue.empty) with EventLogger)
+      StateUpdateResult(DoNothing, new RetryingFailedSends(sender, connector, nPendingSends - 1, pendingReplies.enqueue(cmd), failedSends, incomingCommands) with EventLogger)
     }
 
-    override def connectionBroken(cause: Throwable, connector: Connector) = if(pending.isEmpty) {
-      StateUpdateResult((Queue.empty, () => connector.scheduleConnect(5000)), new ConnectionBroken(cause) with EventLogger)
+    private def failPendingAndReconnect(cause: Throwable) {
+      pendingReplies.foreach(_._2.failure(cause))
+      sender.close()
+      connector.connectAsync()
+    }
+
+
+    override def sendFailure(cause: Throwable, cmd: NettyClient.CommandAndResponse): StateUpdateResult[NettyClient.ArtifactFunction] = if(nPendingSends == 1) {
+      StateUpdateResult(() => failPendingAndReconnect(cause), WaitingForConnection(failedSends.enqueue(cmd).enqueue(incomingCommands)))
     } else {
-      StateUpdateResult((pending, DoNothing), new WaitingForConnection(Queue.empty) with EventLogger)
+      StateUpdateResult(DoNothing, RetryingFailedSends(sender, connector, nPendingSends - 1, pendingReplies, failedSends.enqueue(cmd), incomingCommands))
     }
   }
 
 
 
 
-  case class ConnectionEstablished(sender: Sender, pendingReplies: CommandQueue, retries: CommandQueue) extends ClientState {
-    def send(cmd: CommandAndResponse) = StateUpdateResult(() => sender.send(cmd), this)
+  case class ConnectionEstablished(sender: Sender, connector: Connector, nPendingSends: Int, pendingReplies: CommandQueue, failedSends: CommandQueue) extends ClientState {
 
-    def commandSent(cmd: CommandAndResponse) = StateUpdateResult((), new ConnectionEstablished(sender, pendingReplies.enqueue(cmd), retries) with EventLogger)
+    def failPendingAndReconnect(cause: Throwable) {
+      pendingReplies.foreach(_._2.failure(cause))
+      sender.close()
+      connector.connectAsync()
+    }
 
-    def sendFailure(cmd: NettyClient.CommandAndResponse) = StateUpdateResult(() => sender.close(), new ConnectionEstablished(sender, pendingReplies, retries.enqueue(cmd)) with EventLogger)
+    override def send(cmd: CommandAndResponse) =
+      StateUpdateResult(() => sender.send(cmd), new ConnectionEstablished(sender, connector, nPendingSends + 1, pendingReplies, failedSends) with EventLogger)
 
-    def responseReceived(response: String) = {
+    override def commandSent(cmd: CommandAndResponse) =
+      StateUpdateResult(DoNothing, new ConnectionEstablished(sender, connector, nPendingSends - 1, pendingReplies.enqueue(cmd), failedSends) with EventLogger)
+
+    override def sendFailure(cause: Throwable, cmd: CommandAndResponse) = if(nPendingSends == 1) {
+      StateUpdateResult(() => failPendingAndReconnect(cause), new WaitingForConnection(failedSends.enqueue(cmd)) with EventLogger)
+    } else {
+      StateUpdateResult(DoNothing, new ConnectionEstablished(sender, connector, nPendingSends - 1, pendingReplies, failedSends.enqueue(cmd)) with EventLogger)
+    }
+
+    override def responseReceived(response: String) = {
       val (hd, tl) = pendingReplies.dequeue
-      StateUpdateResult(() => hd._2.success(response), new ConnectionEstablished(sender, tl, retries) with EventLogger)
+      StateUpdateResult(() => hd._2.success(response), new ConnectionEstablished(sender, connector, nPendingSends, tl, failedSends) with EventLogger)
     }
 
-    def connectionEstablished(sender: Sender): StateUpdateResult[CommandQueue] = illegalState("connectionEstablished")
-
-    def connectionBroken(cause: Throwable, connector: Connector) = if(pendingReplies.isEmpty) {
-      StateUpdateResult((Queue.empty, () => connector.connectAsync()), new WaitingForConnection(retries) with EventLogger)
+    override def receiveFailure(cause: Throwable): StateUpdateResult[ArtifactFunction] = if(nPendingSends == 0){
+      StateUpdateResult(() => failPendingAndReconnect(cause), new WaitingForConnection(failedSends) with EventLogger)
     } else {
-      StateUpdateResult((pendingReplies, DoNothing), new ConnectionEstablished(sender, Queue.empty, retries) with EventLogger)
+      StateUpdateResult(DoNothing, this)
     }
-
-
   }
 
   case class ConnectionBroken(cause: Throwable) extends ClientState {
-    def send(cmd: NettyClient.CommandAndResponse) = StateUpdateResult(() => cmd._2.failure(cause), this)
+    override def send(cmd: NettyClient.CommandAndResponse) = StateUpdateResult(() => cmd._2.failure(cause), this)
 
-    def commandSent(cmd: NettyClient.CommandAndResponse): StateUpdateResult[Unit] = illegalState("commandSent")
+    override def connectionEstablished(sender: Sender, connector: Connector): StateUpdateResult[ArtifactFunction] =
+      StateUpdateResult(DoNothing, new ConnectionEstablished(sender, connector, 0, Queue.empty, Queue.empty) with EventLogger)
 
-    def sendFailure(cmd: NettyClient.CommandAndResponse): StateUpdateResult[ArtifactFunction] = illegalState("sendFailure")
-
-    def responseReceived(response: String): StateUpdateResult[NettyClient.ArtifactFunction] = illegalState("responseReceived")
-
-    def connectionEstablished(sender: Sender): StateUpdateResult[NettyClient.CommandQueue] = StateUpdateResult(Queue.empty, ConnectionEstablished(sender, Queue.empty, Queue.empty))
-
-    def connectionBroken(cause: Throwable, connector: Connector): StateUpdateResult[(NettyClient.CommandQueue, NettyClient.ArtifactFunction)] =
-      StateUpdateResult((Queue.empty, () => connector.scheduleConnect(5000)), this)
+    override def connectionBroken(cause: Throwable, connector: Connector): StateUpdateResult[ArtifactFunction] =
+      StateUpdateResult(() => connector.scheduleConnect(5000), this)
   }
 
 
